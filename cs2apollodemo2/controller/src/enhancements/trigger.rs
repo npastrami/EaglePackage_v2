@@ -1,0 +1,190 @@
+use std::time::Instant;
+
+use anyhow::Context;
+use cs2::EntitySystem;
+use cs2_schema_generated::{
+    cs2::client::C_CSPlayerPawn,
+    EntityHandle,
+};
+use obfstr::obfstr;
+use rand::{
+    distributions::Uniform,
+    prelude::Distribution,
+};
+use utils_state::StateRegistry;
+use valthrun_kernel_interface::MouseState;
+
+use super::Enhancement;
+use crate::{
+    settings::AppSettings,
+    view::{
+        KeyToggle,
+        LocalCrosshair,
+    },
+    UpdateContext,
+};
+
+enum TriggerState {
+    Idle,
+    Pending { delay: u32, timestamp: Instant },
+    Active,
+}
+
+pub struct TriggerBot {
+    toggle: KeyToggle,
+    state: TriggerState,
+    trigger_active: bool,
+}
+
+impl TriggerBot {
+    pub fn new() -> Self {
+        Self {
+            toggle: KeyToggle::new(),
+            state: TriggerState::Idle,
+            trigger_active: false,
+        }
+    }
+
+    fn should_be_active(&self, ctx: &UpdateContext) -> anyhow::Result<bool> {
+        let settings = ctx.states.resolve::<AppSettings>(())?;
+        let crosshair = ctx.states.resolve::<LocalCrosshair>(())?;
+        let entities = ctx.states.resolve::<EntitySystem>(())?;
+
+        let target = match crosshair.current_target() {
+            Some(target) => target,
+            None => return Ok(false),
+        };
+
+        if !target
+            .entity_type
+            .as_ref()
+            .map(|t| t == "C_CSPlayerPawn")
+            .unwrap_or(false)
+        {
+            return Ok(false);
+        }
+
+        if settings.trigger_bot_team_check {
+            let crosshair_entity = entities
+                .get_by_handle(&EntityHandle::<C_CSPlayerPawn>::from_index(
+                    target.entity_id,
+                ))?
+                .context("missing crosshair player pawn")?
+                .entity()?
+                .read_schema()?;
+
+            let local_player_controller = entities.get_local_player_controller()?;
+            if local_player_controller.is_null()? {
+                return Ok(false);
+            }
+
+            let local_player_controller = local_player_controller.reference_schema()?;
+
+            let target_player = crosshair_entity.as_schema::<C_CSPlayerPawn>()?;
+            if target_player.m_iTeamNum()? == local_player_controller.m_iTeamNum()? {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+}
+
+impl Enhancement for TriggerBot {
+    fn update(&mut self, ctx: &UpdateContext) -> anyhow::Result<()> {
+        let settings = ctx.states.resolve::<AppSettings>(())?;
+        if self.toggle.update(
+            &settings.trigger_bot_mode,
+            ctx.input,
+            &settings.key_trigger_bot,
+        ) {
+            ctx.cs2.add_metrics_record(
+                obfstr!("feature-trigger-bot-toggle"),
+                &format!(
+                    "enabled: {}, mode: {:?}",
+                    self.toggle.enabled, settings.trigger_bot_mode
+                ),
+            );
+        }
+
+        let should_shoot: bool = if self.toggle.enabled {
+            self.should_be_active(ctx)?
+        } else {
+            false
+        };
+
+        loop {
+            match &self.state {
+                TriggerState::Idle => {
+                    if !should_shoot {
+                        /* nothing changed */
+                        break;
+                    }
+
+                    let delay_min = settings
+                        .trigger_bot_delay_min
+                        .min(settings.trigger_bot_delay_max);
+                    let delay_max = settings
+                        .trigger_bot_delay_min
+                        .max(settings.trigger_bot_delay_max);
+                    let selected_delay = if delay_max == delay_min {
+                        delay_min
+                    } else {
+                        let dist = Uniform::new_inclusive(delay_min, delay_max);
+                        dist.sample(&mut rand::thread_rng())
+                    };
+
+                    log::trace!(
+                        "Setting trigger bot into pending mode with a delay of {}ms",
+                        selected_delay
+                    );
+                    self.state = TriggerState::Pending {
+                        delay: selected_delay,
+                        timestamp: Instant::now(),
+                    };
+                }
+                TriggerState::Pending { delay, timestamp } => {
+                    let time_elapsed = timestamp.elapsed().as_millis();
+                    if time_elapsed < *delay as u128 {
+                        /* still waiting to be activated */
+                        break;
+                    }
+
+                    if settings.trigger_bot_check_target_after_delay && !should_shoot {
+                        self.state = TriggerState::Idle;
+                    } else {
+                        self.state = TriggerState::Active;
+                    }
+                    /* regardsless of the next state, we always need to execute the current action */
+                    break;
+                }
+                TriggerState::Active => {
+                    if should_shoot {
+                        /* nothing changed */
+                        break;
+                    }
+
+                    self.state = TriggerState::Idle;
+                }
+            }
+        }
+
+        let should_be_active = matches!(self.state, TriggerState::Active);
+        if should_be_active != self.trigger_active {
+            self.trigger_active = should_be_active;
+
+            let mut state = MouseState {
+                ..Default::default()
+            };
+            state.buttons[0] = Some(self.trigger_active);
+            ctx.cs2.send_mouse_state(&[state])?;
+            log::trace!("Setting shoot state to {}", self.trigger_active);
+        }
+
+        Ok(())
+    }
+
+    fn render(&self, _states: &StateRegistry, _ui: &imgui::Ui) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
